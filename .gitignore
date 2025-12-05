@@ -1,25 +1,5 @@
-# Google Ads MCP Environment Configuration
-# Copy this file to .env and fill in your actual values
-
-# Authentication Type (choose one: "oauth" or "service_account")
-GOOGLE_ADS_AUTH_TYPE=oauth
-
-# Credentials Path
-# For OAuth: Path to client_secret.json or saved token file
-# For Service Account: Path to service account key file
-# GOOGLE_ADS_CREDENTIALS_PATH=/path/to/credentials.json
-
-# Google Ads Developer Token (required)
 GOOGLE_ADS_DEVELOPER_TOKEN=cgwoHyu83rWetH9vXABkCw
-
-# Manager Account ID (optional, for MCC accounts)
-# Format: XXX-XXX-XXXX or XXXXXXXXXX
-GOOGLE_ADS_LOGIN_CUSTOMER_ID=557-568-0104
-
-# For OAuth-specific config (required if using OAuth and there's no client_secret.json)
-GOOGLE_ADS_CLIENT_ID=341013235507-k8qiku23j54e4e79k2714saf1tu8q42t.apps.googleusercontent.com
-GOOGLE_ADS_CLIENT_SECRET=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
-
-# For Service Account-specific config (optional)
-# Email to impersonate with the service account (typically your admin email)
-# GOOGLE_ADS_IMPERSONATION_EMAIL=
+GOOGLE_ADS_CLIENT_ID=1071231213389-m13dfkd34p1tc5mb0sc664v73q2u3tsq.apps.googleusercontent.com
+GOOGLE_ADS_CLIENT_SECRET=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
+#GOOGLE_ADS_LOGIN_CUSTOMER_ID=557-568-0104  # Optional
+GOOGLE_ADS_AUTH_TYPE=oauth  # or service_account
