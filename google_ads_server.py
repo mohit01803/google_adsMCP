@@ -26,7 +26,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('google_ads_mcp_server.log'),
         logging.StreamHandler(sys.stderr)
     ]
 )
@@ -1371,3 +1370,4 @@ if __name__ == "__main__":
         port=port,
         path="/mcp"
     )
+
