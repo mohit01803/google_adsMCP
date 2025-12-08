@@ -69,7 +69,7 @@ try:
         port=int(os.getenv('POSTGRES_PORT', '5432')),
         database=os.getenv('POSTGRES_DB', 'neondb'),
         user=os.getenv('POSTGRES_USER', 'neondb_owner'),
-        password=os.getenv('POSTGRES_PASSWORD', 'npg_h1HGqr8Y8KRWGep')
+        password=os.getenv('POSTGRES_PASSWORD', 'npg_3cGYslJfLRg6')
     )
     USE_POSTGRES = True
     logger.info("=" * 60)
@@ -1317,3 +1317,4 @@ if __name__ == "__main__":
         port=port,
         path="/mcp"
     )
+
