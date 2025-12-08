@@ -3,3 +3,9 @@ GOOGLE_ADS_CLIENT_ID=1071231213389-m13dfkd34p1tc5mb0sc664v73q2u3tsq.apps.googleu
 GOOGLE_ADS_CLIENT_SECRET=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
 #GOOGLE_ADS_LOGIN_CUSTOMER_ID=557-568-0104  # Optional
 GOOGLE_ADS_AUTH_TYPE=oauth  # or service_account
+
+POSTGRES_HOST=jolly-base-ad5zrzvc-pooler.c-2.us-east-1.aws.neon.tech
+POSTGRES_PORT=5432
+POSTGRES_DB=neondb
+POSTGRES_USER=neondb_owner
+POSTGRES_PASSWORD=npg_3cGYslJfLRg6
