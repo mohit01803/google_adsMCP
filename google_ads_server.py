@@ -6,6 +6,7 @@ import requests
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+import hashlib
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -43,11 +44,15 @@ mcp = FastMCP(
 
 # Constants and configuration
 SCOPES = ['https://www.googleapis.com/auth/adwords']
-API_VERSION = "v19"  # Google Ads API version
-TOKEN_FILE = Path.home() / '.google_ads_token.json'  # Token storage location
+API_VERSION = "v19"
+
+# MULTI-USER: Token storage per user
+TOKEN_STORAGE_DIR = Path(os.environ.get("TOKEN_STORAGE_PATH", "/tmp/google_ads_tokens"))
+TOKEN_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 logger.info("=" * 60)
-logger.info("Google Ads MCP Server Starting (HTTP Streamable)...")
+logger.info("Google Ads MCP Server Starting (MULTI-USER MODE)...")
+logger.info(f"Token storage directory: {TOKEN_STORAGE_DIR}")
 logger.info("=" * 60)
 
 # Load environment variables
@@ -60,104 +65,92 @@ except ImportError:
 
 # Get credentials from environment variables
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
-# Login customer ID is now optional - can be set per request or in env
-GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
-GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
+GOOGLE_ADS_CLIENT_ID = os.environ.get("GOOGLE_ADS_CLIENT_ID")
+GOOGLE_ADS_CLIENT_SECRET = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
 
-def get_credentials():
-    """Get and refresh OAuth credentials or service account credentials based on the auth type."""
-    auth_type = GOOGLE_ADS_AUTH_TYPE.lower()
-    logger.info(f"Using authentication type: {auth_type}")
-    
-    if auth_type == "service_account":
-        try:
-            return get_service_account_credentials()
-        except Exception as e:
-            logger.error(f"Error with service account authentication: {str(e)}")
-            raise
-    
-    return get_oauth_credentials()
+# MULTI-USER: In-memory cache for user credentials
+# In production, use Redis or database
+USER_CREDENTIALS_CACHE = {}
 
-def get_service_account_credentials():
-    """Get credentials using service account (if applicable)."""
-    logger.info("Loading service account credentials from environment variables")
-    
-    # For service accounts, you'd typically use a JSON key file
-    service_account_file = os.environ.get("GOOGLE_ADS_SERVICE_ACCOUNT_FILE")
-    
-    if not service_account_file:
-        raise ValueError("GOOGLE_ADS_SERVICE_ACCOUNT_FILE must be set for service account auth")
-    
+def get_user_token_file(user_id: str) -> Path:
+    """Get the token file path for a specific user."""
+    # Hash user_id for privacy and to avoid filesystem issues
+    user_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
+    return TOKEN_STORAGE_DIR / f"token_{user_hash}.json"
+
+def save_user_token(user_id: str, creds: Credentials):
+    """Save user's OAuth token."""
+    token_file = get_user_token_file(user_id)
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            service_account_file,
-            scopes=SCOPES
-        )
-        logger.info("Service account credentials loaded successfully")
-        return credentials
-        
+        with open(token_file, 'w') as f:
+            f.write(creds.to_json())
+        logger.info(f"Saved token for user: {user_id}")
+        # Also cache in memory
+        USER_CREDENTIALS_CACHE[user_id] = creds
     except Exception as e:
-        logger.error(f"Error loading service account credentials: {str(e)}")
+        logger.error(f"Error saving token for user {user_id}: {e}")
         raise
 
-def get_oauth_credentials():
-    """Get and refresh OAuth user credentials with token persistence."""
-    creds = None
+def load_user_token(user_id: str) -> Optional[Credentials]:
+    """Load user's OAuth token from cache or file."""
+    # First check in-memory cache
+    if user_id in USER_CREDENTIALS_CACHE:
+        logger.info(f"Loaded token from cache for user: {user_id}")
+        return USER_CREDENTIALS_CACHE[user_id]
     
-    # Try to load existing token
-    if TOKEN_FILE.exists():
+    # Then check file
+    token_file = get_user_token_file(user_id)
+    if token_file.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
-            logger.info("Loaded existing OAuth credentials from token file")
+            creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+            USER_CREDENTIALS_CACHE[user_id] = creds
+            logger.info(f"Loaded token from file for user: {user_id}")
+            return creds
         except Exception as e:
-            logger.warning(f"Could not load saved credentials: {e}")
+            logger.warning(f"Could not load token for user {user_id}: {e}")
     
-    # If no valid credentials, do the OAuth flow
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            # Refresh expired token
+    return None
+
+def delete_user_token(user_id: str):
+    """Delete user's stored token."""
+    token_file = get_user_token_file(user_id)
+    if token_file.exists():
+        token_file.unlink()
+    if user_id in USER_CREDENTIALS_CACHE:
+        del USER_CREDENTIALS_CACHE[user_id]
+    logger.info(f"Deleted token for user: {user_id}")
+
+def get_user_credentials(user_id: str, refresh_if_needed: bool = True) -> Credentials:
+    """
+    Get OAuth credentials for a specific user.
+    
+    Args:
+        user_id: Unique identifier for the user (email, user_id, etc.)
+        refresh_if_needed: Whether to refresh expired tokens
+    """
+    if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
+        raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set")
+    
+    creds = load_user_token(user_id)
+    
+    # If credentials exist but are expired, try to refresh
+    if creds and not creds.valid and refresh_if_needed:
+        if creds.expired and creds.refresh_token:
             try:
-                logger.info("Refreshing expired OAuth token")
+                logger.info(f"Refreshing expired token for user: {user_id}")
                 creds.refresh(Request())
-                logger.info("Token successfully refreshed")
+                save_user_token(user_id, creds)
+                logger.info(f"Token refreshed successfully for user: {user_id}")
             except RefreshError as e:
-                logger.error(f"Error refreshing token: {str(e)}")
-                # Delete invalid token file and re-authenticate
-                if TOKEN_FILE.exists():
-                    TOKEN_FILE.unlink()
-                    logger.info("Deleted invalid token file, will re-authenticate")
-                creds = None
-        
-        if not creds or not creds.valid:
-            # Need to do full OAuth flow
-            client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
-            client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
-            
-            if not client_id or not client_secret:
-                raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set")
-            
-            client_config = {
-                "installed": {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
-                }
-            }
-            
-            logger.info("Starting OAuth authentication flow (browser will open)")
-            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)
-            logger.info("OAuth flow completed successfully")
-        
-        # Save the credentials for next time
-        try:
-            with open(TOKEN_FILE, 'w') as f:
-                f.write(creds.to_json())
-            logger.info(f"Saved credentials to {TOKEN_FILE}")
-        except Exception as e:
-            logger.warning(f"Could not save credentials: {e}")
+                logger.error(f"Error refreshing token for user {user_id}: {e}")
+                # Delete invalid token
+                delete_user_token(user_id)
+                raise ValueError(f"Token expired and could not be refreshed. User needs to re-authenticate.")
+        else:
+            raise ValueError("User credentials are invalid. Re-authentication required.")
+    
+    if not creds or not creds.valid:
+        raise ValueError(f"No valid credentials found for user: {user_id}. Please authenticate first using start_oauth_flow()")
     
     return creds
 
@@ -168,76 +161,274 @@ def format_customer_id(customer_id: str) -> str:
     customer_id = ''.join(char for char in customer_id if char.isdigit())
     return customer_id.zfill(10)
 
-def get_headers(creds, login_customer_id: Optional[str] = None):
-    """
-    Get headers for Google Ads API requests.
-    
-    Args:
-        creds: OAuth or service account credentials
-        login_customer_id: Optional login customer ID to use for this request.
-                          If provided, overrides the environment variable.
-    """
+def get_headers(creds: Credentials, login_customer_id: Optional[str] = None):
+    """Get headers for Google Ads API requests."""
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
     
-    if isinstance(creds, service_account.Credentials):
-        auth_req = Request()
-        creds.refresh(auth_req)
-        token = creds.token
-    else:
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                try:
-                    logger.info("Refreshing expired OAuth token in get_headers")
-                    creds.refresh(Request())
-                    logger.info("Token successfully refreshed in get_headers")
-                    
-                    # Save the refreshed token
-                    try:
-                        with open(TOKEN_FILE, 'w') as f:
-                            f.write(creds.to_json())
-                        logger.info("Saved refreshed credentials")
-                    except Exception as e:
-                        logger.warning(f"Could not save refreshed credentials: {e}")
-                        
-                except RefreshError as e:
-                    logger.error(f"Error refreshing token in get_headers: {str(e)}")
-                    raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Unexpected error refreshing token in get_headers: {str(e)}")
-                    raise
-            else:
-                raise ValueError("OAuth credentials are invalid and cannot be refreshed")
-        
-        token = creds.token
-        
+    if not creds.valid:
+        raise ValueError("Invalid credentials")
+    
     headers = {
-        'Authorization': f'Bearer {token}',
+        'Authorization': f'Bearer {creds.token}',
         'developer-token': GOOGLE_ADS_DEVELOPER_TOKEN,
         'content-type': 'application/json'
     }
     
-    # Use the provided login_customer_id if given, otherwise fall back to env variable
-    customer_id_to_use = login_customer_id or GOOGLE_ADS_LOGIN_CUSTOMER_ID
-    if customer_id_to_use:
-        headers['login-customer-id'] = format_customer_id(customer_id_to_use)
-        logger.info(f"Using login-customer-id: {format_customer_id(customer_id_to_use)}")
+    if login_customer_id:
+        headers['login-customer-id'] = format_customer_id(login_customer_id)
     
     return headers
 
+# ============================================================================
+# MULTI-USER AUTHENTICATION TOOLS
+# ============================================================================
+
 @mcp.tool()
-async def list_accounts() -> str:
+async def start_oauth_flow(
+    user_id: str = Field(description="Unique identifier for the user (email, username, etc.)"),
+    redirect_uri: str = Field(default="urn:ietf:wg:oauth:2.0:oob", description="OAuth redirect URI")
+) -> str:
     """
-    Lists all accessible Google Ads accounts.
+    Start OAuth authentication flow for a new user.
     
-    This is typically the first command you should run to identify which accounts 
-    you have access to. The returned account IDs can be used in subsequent commands.
+    This generates an authorization URL that the user must visit to grant access.
+    After granting access, they'll receive an authorization code.
     
+    WORKFLOW:
+    1. Call this function with user's unique ID
+    2. Send the returned URL to the user
+    3. User visits URL and grants access
+    4. User receives authorization code
+    5. Call complete_oauth_flow() with the code
+    
+    Args:
+        user_id: Unique identifier for the user (email, username, etc.)
+        redirect_uri: OAuth redirect URI (default works for manual flow)
+        
     Returns:
-        A formatted list of all Google Ads accounts accessible with your credentials
+        JSON with authorization URL and instructions
     """
     try:
-        creds = get_credentials()
+        if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
+            return json.dumps({
+                "error": "OAuth credentials not configured",
+                "message": "GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set"
+            })
+        
+        client_config = {
+            "installed": {
+                "client_id": GOOGLE_ADS_CLIENT_ID,
+                "client_secret": GOOGLE_ADS_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [redirect_uri]
+            }
+        }
+        
+        flow = InstalledAppFlow.from_client_config(
+            client_config,
+            SCOPES,
+            redirect_uri=redirect_uri
+        )
+        
+        # Generate authorization URL
+        auth_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        
+        # Store flow in cache for this user (temporary)
+        USER_CREDENTIALS_CACHE[f"{user_id}_flow"] = flow
+        
+        return json.dumps({
+            "success": True,
+            "user_id": user_id,
+            "authorization_url": auth_url,
+            "instructions": [
+                "1. Send this URL to the user",
+                "2. User clicks the URL and grants access",
+                "3. User receives an authorization code",
+                "4. Call complete_oauth_flow() with the code"
+            ],
+            "next_step": f"complete_oauth_flow(user_id='{user_id}', auth_code='CODE_FROM_USER')"
+        }, indent=2)
+        
+    except Exception as e:
+        logger.error(f"Error starting OAuth flow for user {user_id}: {e}")
+        return json.dumps({
+            "error": str(e)
+        })
+
+@mcp.tool()
+async def complete_oauth_flow(
+    user_id: str = Field(description="Unique identifier for the user"),
+    auth_code: str = Field(description="Authorization code received from Google")
+) -> str:
+    """
+    Complete OAuth flow with the authorization code.
+    
+    After user visits the authorization URL and grants access, they receive a code.
+    Use that code here to complete authentication.
+    
+    Args:
+        user_id: Same user_id used in start_oauth_flow()
+        auth_code: Authorization code from Google
+        
+    Returns:
+        Success message with user's accessible accounts
+    """
+    try:
+        # Get the flow from cache
+        flow_key = f"{user_id}_flow"
+        flow = USER_CREDENTIALS_CACHE.get(flow_key)
+        
+        if not flow:
+            return json.dumps({
+                "error": "OAuth flow not found",
+                "message": f"Please call start_oauth_flow(user_id='{user_id}') first"
+            })
+        
+        # Exchange code for credentials
+        flow.fetch_token(code=auth_code)
+        creds = flow.credentials
+        
+        # Save credentials for this user
+        save_user_token(user_id, creds)
+        
+        # Clean up flow from cache
+        del USER_CREDENTIALS_CACHE[flow_key]
+        
+        # Try to get user's accounts to verify
+        try:
+            headers = get_headers(creds)
+            url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                customers = response.json()
+                account_count = len(customers.get('resourceNames', []))
+                
+                return json.dumps({
+                    "success": True,
+                    "message": f"Authentication successful for user: {user_id}",
+                    "accessible_accounts": account_count,
+                    "next_steps": [
+                        "User can now use all Google Ads tools",
+                        f"Use user_id='{user_id}' in all tool calls"
+                    ]
+                }, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not fetch accounts but auth succeeded: {e}")
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Authentication successful for user: {user_id}",
+            "next_steps": [
+                "User can now use all Google Ads tools",
+                f"Use user_id='{user_id}' in all tool calls"
+            ]
+        }, indent=2)
+        
+    except Exception as e:
+        logger.error(f"Error completing OAuth flow for user {user_id}: {e}")
+        return json.dumps({
+            "error": str(e),
+            "message": "Failed to complete authentication"
+        })
+
+@mcp.tool()
+async def check_user_auth(
+    user_id: str = Field(description="Unique identifier for the user")
+) -> str:
+    """
+    Check if a user is authenticated and their token is valid.
+    
+    Args:
+        user_id: User's unique identifier
+        
+    Returns:
+        Authentication status and token expiry info
+    """
+    try:
+        creds = load_user_token(user_id)
+        
+        if not creds:
+            return json.dumps({
+                "authenticated": False,
+                "user_id": user_id,
+                "message": "User not authenticated",
+                "action": f"Call start_oauth_flow(user_id='{user_id}') to authenticate"
+            }, indent=2)
+        
+        # Check if valid
+        is_valid = creds.valid
+        is_expired = creds.expired if hasattr(creds, 'expired') else False
+        has_refresh = bool(creds.refresh_token) if hasattr(creds, 'refresh_token') else False
+        
+        expiry_str = creds.expiry.isoformat() if hasattr(creds, 'expiry') and creds.expiry else "Unknown"
+        
+        return json.dumps({
+            "authenticated": True,
+            "user_id": user_id,
+            "token_valid": is_valid,
+            "token_expired": is_expired,
+            "has_refresh_token": has_refresh,
+            "token_expiry": expiry_str,
+            "status": "ready" if is_valid else "needs_refresh"
+        }, indent=2)
+        
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "user_id": user_id
+        })
+
+@mcp.tool()
+async def revoke_user_access(
+    user_id: str = Field(description="Unique identifier for the user")
+) -> str:
+    """
+    Revoke access and delete stored credentials for a user.
+    
+    Args:
+        user_id: User's unique identifier
+        
+    Returns:
+        Confirmation message
+    """
+    try:
+        delete_user_token(user_id)
+        return json.dumps({
+            "success": True,
+            "message": f"Access revoked for user: {user_id}",
+            "action": "User must re-authenticate to use tools again"
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "error": str(e)
+        })
+
+# ============================================================================
+# GOOGLE ADS TOOLS (WITH USER_ID)
+# ============================================================================
+
+@mcp.tool()
+async def list_accounts(
+    user_id: str = Field(description="Unique identifier for the user")
+) -> str:
+    """
+    List all accessible Google Ads accounts for a user.
+    
+    Args:
+        user_id: User's unique identifier
+        
+    Returns:
+        Formatted list of accessible accounts
+    """
+    try:
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds)
         
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
@@ -248,10 +439,9 @@ async def list_accounts() -> str:
         
         customers = response.json()
         if not customers.get('resourceNames'):
-            return "No accessible accounts found."
+            return f"No accessible accounts found for user: {user_id}"
         
-        # Format the results
-        result_lines = ["Accessible Google Ads Accounts:"]
+        result_lines = [f"Accessible Google Ads Accounts for {user_id}:"]
         result_lines.append("-" * 50)
         
         for resource_name in customers['resourceNames']:
@@ -260,146 +450,102 @@ async def list_accounts() -> str:
             result_lines.append(f"Account ID: {formatted_id}")
         
         result_lines.append("\n" + "=" * 50)
-        result_lines.append("💡 TIP: Use get_account_details() to see account names and hierarchy")
+        result_lines.append("💡 TIP: Use get_account_details() to see account names")
         result_lines.append("=" * 50)
         
         return "\n".join(result_lines)
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}\nPlease call start_oauth_flow(user_id='{user_id}') to authenticate."
     except Exception as e:
         return f"Error listing accounts: {str(e)}"
 
 @mcp.tool()
-async def get_account_details(
-    login_customer_id: str = Field(
-        default="",
-        description="Optional: Manager account ID to use for authentication. Leave empty to use env variable."
-    )
+async def get_campaign_performance(
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    days: int = Field(default=30, description="Number of days to look back"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Get detailed information about all accessible accounts including names and hierarchy.
-    
-    This tool shows you:
-    - Account IDs
-    - Account Names  
-    - Account Types (Manager vs Client)
-    - Currency
-    - Time Zone
-    
-    This is very useful when you have multiple accounts and want to see which one is which!
-    
-    Args:
-        login_customer_id: Optional manager account ID. If you have multiple accounts,
-                          you might need to specify which manager account to use.
-    
-    Returns:
-        Detailed information about all accessible accounts
-        
-    Example:
-        get_account_details()  # Uses env variable
-        get_account_details(login_customer_id="1234567890")  # Uses specific manager account
-    """
+    """Get campaign performance metrics for a user's account."""
     try:
-        creds = get_credentials()
-        
-        # First get list of accessible customers
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
-        response = requests.get(url, headers=headers)
+        
+        formatted_customer_id = format_customer_id(customer_id)
+        
+        query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                campaign.status,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.average_cpc
+            FROM campaign
+            WHERE segments.date DURING LAST_{days}_DAYS
+            ORDER BY metrics.cost_micros DESC
+            LIMIT 50
+        """
+        
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        payload = {"query": query}
+        response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error accessing accounts: {response.text}"
+            return f"Error executing query: {response.text}"
         
-        customers = response.json()
-        if not customers.get('resourceNames'):
-            return "No accessible accounts found."
+        results = response.json()
+        if not results.get('results'):
+            return "No campaign data found for the specified period."
         
-        result_lines = ["📊 Detailed Account Information:"]
-        result_lines.append("=" * 100)
+        # Format results
+        result_lines = [f"Campaign Performance for {user_id} - Account {formatted_customer_id}:"]
+        result_lines.append("-" * 80)
         
-        # Get detailed info for each account
-        for resource_name in customers['resourceNames']:
-            customer_id = resource_name.split('/')[-1]
-            formatted_id = format_customer_id(customer_id)
+        for result in results['results']:
+            campaign = result.get('campaign', {})
+            metrics = result.get('metrics', {})
             
-            # Query for account details
-            query = """
-                SELECT
-                    customer.id,
-                    customer.descriptive_name,
-                    customer.currency_code,
-                    customer.time_zone,
-                    customer.manager,
-                    customer.status
-                FROM customer
-                LIMIT 1
-            """
-            
-            try:
-                # Use this specific customer_id for the query
-                detail_headers = get_headers(creds, login_customer_id if login_customer_id else None)
-                detail_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_id}/googleAds:search"
-                payload = {"query": query}
-                detail_response = requests.post(detail_url, headers=detail_headers, json=payload)
-                
-                if detail_response.status_code == 200:
-                    detail_results = detail_response.json()
-                    if detail_results.get('results'):
-                        customer_data = detail_results['results'][0].get('customer', {})
-                        
-                        account_type = "🏢 Manager Account" if customer_data.get('manager') else "📈 Client Account"
-                        status = customer_data.get('status', 'UNKNOWN')
-                        
-                        result_lines.append(f"\n{account_type}")
-                        result_lines.append(f"  Account ID: {formatted_id}")
-                        result_lines.append(f"  Name: {customer_data.get('descriptiveName', 'N/A')}")
-                        result_lines.append(f"  Currency: {customer_data.get('currencyCode', 'N/A')}")
-                        result_lines.append(f"  Time Zone: {customer_data.get('timeZone', 'N/A')}")
-                        result_lines.append(f"  Status: {status}")
-                        result_lines.append("-" * 80)
-                else:
-                    result_lines.append(f"\n  Account ID: {formatted_id}")
-                    result_lines.append(f"  (Could not fetch details: {detail_response.status_code})")
-                    result_lines.append("-" * 80)
-                    
-            except Exception as e:
-                result_lines.append(f"\n  Account ID: {formatted_id}")
-                result_lines.append(f"  (Error fetching details: {str(e)})")
-                result_lines.append("-" * 80)
-        
-        result_lines.append("\n" + "=" * 100)
-        result_lines.append("💡 TIP: Use the Account ID in other commands with customer_id parameter")
-        result_lines.append("=" * 100)
+            result_lines.append(f"\nCampaign: {campaign.get('name', 'N/A')}")
+            result_lines.append(f"  ID: {campaign.get('id', 'N/A')}")
+            result_lines.append(f"  Status: {campaign.get('status', 'N/A')}")
+            result_lines.append(f"  Impressions: {metrics.get('impressions', 0):,}")
+            result_lines.append(f"  Clicks: {metrics.get('clicks', 0):,}")
+            result_lines.append(f"  Cost (micros): {metrics.get('costMicros', 0):,}")
+            result_lines.append(f"  Conversions: {metrics.get('conversions', 0)}")
+            result_lines.append("-" * 80)
         
         return "\n".join(result_lines)
-    
+        
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
-        return f"Error getting account details: {str(e)}"
+        return f"Error getting campaign performance: {str(e)}"
 
 @mcp.tool()
 async def execute_gaql_query(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
-    query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
-    login_customer_id: str = Field(default="", description="Optional: Manager account ID if needed for authentication")
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    query: str = Field(description="Valid GAQL query string"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
     """
-    Execute a custom GAQL (Google Ads Query Language) query.
-    
-    This tool allows you to run any valid GAQL query against the Google Ads API.
+    Execute a custom GAQL query for a user's account.
     
     Args:
-        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
-        query: The GAQL query to execute (must follow GAQL syntax)
-        login_customer_id: Optional manager account ID for authentication
+        user_id: User's unique identifier
+        customer_id: Google Ads customer ID
+        query: GAQL query to execute
+        login_customer_id: Optional manager account ID
         
     Returns:
-        Formatted query results or error message
-        
-    Example:
-        customer_id: "1234567890"
-        query: "SELECT campaign.id, campaign.name FROM campaign LIMIT 10"
+        Formatted query results
     """
     try:
-        creds = get_credentials()
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -415,73 +561,96 @@ async def execute_gaql_query(
         if not results.get('results'):
             return "No results found for the query."
         
-        # Format the results as a table
-        result_lines = [f"Query Results for Account {formatted_customer_id}:"]
+        # Format results as table
+        result_lines = [f"Query Results for {user_id} - Account {formatted_customer_id}:"]
         result_lines.append("-" * 80)
-        
-        # Get field names from the first result
-        fields = []
-        first_result = results['results'][0]
-        for key in first_result:
-            if isinstance(first_result[key], dict):
-                for subkey in first_result[key]:
-                    fields.append(f"{key}.{subkey}")
-            else:
-                fields.append(key)
-        
-        # Add header
-        result_lines.append(" | ".join(fields))
-        result_lines.append("-" * 80)
-        
-        # Add data rows
-        for result in results['results']:
-            row_data = []
-            for field in fields:
-                if "." in field:
-                    parent, child = field.split(".")
-                    value = str(result.get(parent, {}).get(child, ""))
-                else:
-                    value = str(result.get(field, ""))
-                row_data.append(value)
-            result_lines.append(" | ".join(row_data))
+        result_lines.append(json.dumps(results, indent=2))
         
         return "\n".join(result_lines)
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
         return f"Error executing GAQL query: {str(e)}"
 
 @mcp.tool()
-async def get_campaign_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
-    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)"),
+async def get_account_details(
+    user_id: str = Field(description="Unique identifier for the user"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """Get campaign performance metrics for the specified time period."""
-    query = f"""
-        SELECT
-            campaign.id,
-            campaign.name,
-            campaign.status,
-            metrics.impressions,
-            metrics.clicks,
-            metrics.cost_micros,
-            metrics.conversions,
-            metrics.average_cpc
-        FROM campaign
-        WHERE segments.date DURING LAST_{days}_DAYS
-        ORDER BY metrics.cost_micros DESC
-        LIMIT 50
-    """
+    """Get detailed information about all accessible accounts for a user."""
+    try:
+        creds = get_user_credentials(user_id)
+        headers = get_headers(creds, login_customer_id if login_customer_id else None)
+        
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            return f"Error accessing accounts: {response.text}"
+        
+        customers = response.json()
+        if not customers.get('resourceNames'):
+            return "No accessible accounts found."
+        
+        result_lines = [f"📊 Detailed Account Information for {user_id}:"]
+        result_lines.append("=" * 100)
+        
+        for resource_name in customers['resourceNames']:
+            customer_id = resource_name.split('/')[-1]
+            formatted_id = format_customer_id(customer_id)
+            
+            query = """
+                SELECT
+                    customer.id,
+                    customer.descriptive_name,
+                    customer.currency_code,
+                    customer.time_zone,
+                    customer.manager,
+                    customer.status
+                FROM customer
+                LIMIT 1
+            """
+            
+            try:
+                detail_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_id}/googleAds:search"
+                payload = {"query": query}
+                detail_response = requests.post(detail_url, headers=headers, json=payload)
+                
+                if detail_response.status_code == 200:
+                    detail_results = detail_response.json()
+                    if detail_results.get('results'):
+                        customer_data = detail_results['results'][0].get('customer', {})
+                        
+                        account_type = "🏢 Manager Account" if customer_data.get('manager') else "📈 Client Account"
+                        
+                        result_lines.append(f"\n{account_type}")
+                        result_lines.append(f"  Account ID: {formatted_id}")
+                        result_lines.append(f"  Name: {customer_data.get('descriptiveName', 'N/A')}")
+                        result_lines.append(f"  Currency: {customer_data.get('currencyCode', 'N/A')}")
+                        result_lines.append(f"  Time Zone: {customer_data.get('timeZone', 'N/A')}")
+                        result_lines.append(f"  Status: {customer_data.get('status', 'N/A')}")
+                        result_lines.append("-" * 80)
+            except Exception as e:
+                result_lines.append(f"\n  Account ID: {formatted_id}")
+                result_lines.append(f"  (Error fetching details: {str(e)})")
+                result_lines.append("-" * 80)
+        
+        return "\n".join(result_lines)
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
+    except Exception as e:
+        return f"Error getting account details: {str(e)}"
 
 @mcp.tool()
 async def get_ad_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """Get ad performance metrics."""
+    """Get ad performance metrics for a user's account."""
     query = f"""
         SELECT
             ad_group_ad.ad.id,
@@ -499,10 +668,11 @@ async def get_ad_performance(
         LIMIT 50
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def run_gaql(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     query: str = Field(description="Valid GAQL query string"),
     format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
@@ -510,7 +680,7 @@ async def run_gaql(
 ) -> str:
     """Execute any arbitrary GAQL query with custom formatting options."""
     try:
-        creds = get_credentials()
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -554,54 +724,20 @@ async def run_gaql(
             return "\n".join(csv_lines)
         
         else:  # table format
-            result_lines = [f"Query Results for Account {formatted_customer_id}:"]
+            result_lines = [f"Query Results for {user_id} - Account {formatted_customer_id}:"]
             result_lines.append("-" * 100)
-            
-            fields = []
-            field_widths = {}
-            first_result = results['results'][0]
-            
-            for key, value in first_result.items():
-                if isinstance(value, dict):
-                    for subkey in value:
-                        field = f"{key}.{subkey}"
-                        fields.append(field)
-                        field_widths[field] = len(field)
-                else:
-                    fields.append(key)
-                    field_widths[key] = len(key)
-            
-            for result in results['results']:
-                for field in fields:
-                    if "." in field:
-                        parent, child = field.split(".")
-                        value = str(result.get(parent, {}).get(child, ""))
-                    else:
-                        value = str(result.get(field, ""))
-                    field_widths[field] = max(field_widths[field], len(value))
-            
-            header = " | ".join(f"{field:{field_widths[field]}}" for field in fields)
-            result_lines.append(header)
-            result_lines.append("-" * len(header))
-            
-            for result in results['results']:
-                row_data = []
-                for field in fields:
-                    if "." in field:
-                        parent, child = field.split(".")
-                        value = str(result.get(parent, {}).get(child, ""))
-                    else:
-                        value = str(result.get(field, ""))
-                    row_data.append(f"{value:{field_widths[field]}}")
-                result_lines.append(" | ".join(row_data))
+            result_lines.append(json.dumps(results, indent=2))
             
             return "\n".join(result_lines)
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
         return f"Error executing GAQL query: {str(e)}"
 
 @mcp.tool()
 async def get_ad_creatives(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
@@ -624,7 +760,7 @@ async def get_ad_creatives(
     """
     
     try:
-        creds = get_credentials()
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -638,9 +774,9 @@ async def get_ad_creatives(
         
         results = response.json()
         if not results.get('results'):
-            return "No ad creatives found for this customer ID."
+            return "No ad creatives found."
         
-        output_lines = [f"Ad Creatives for Customer ID {formatted_customer_id}:"]
+        output_lines = [f"Ad Creatives for {user_id} - Account {formatted_customer_id}:"]
         output_lines.append("=" * 80)
         
         for i, result in enumerate(results['results'], 1):
@@ -675,11 +811,14 @@ async def get_ad_creatives(
         
         return "\n".join(output_lines)
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
         return f"Error retrieving ad creatives: {str(e)}"
 
 @mcp.tool()
 async def get_account_currency(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
@@ -693,7 +832,7 @@ async def get_account_currency(
     """
     
     try:
-        creds = get_credentials()
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -707,24 +846,26 @@ async def get_account_currency(
         
         results = response.json()
         if not results.get('results'):
-            return "No account information found for this customer ID."
+            return "No account information found."
         
         customer = results['results'][0].get('customer', {})
         currency_code = customer.get('currencyCode', 'Not specified')
         
         return f"Account {formatted_customer_id} uses currency: {currency_code}"
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
-        logger.error(f"Error retrieving account currency: {str(e)}")
         return f"Error retrieving account currency: {str(e)}"
 
 @mcp.tool()
 async def get_image_assets(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     limit: int = Field(default=50, description="Maximum number of image assets to return"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """Retrieve all image assets in the account including their full-size URLs."""
+    """Retrieve all image assets in the account."""
     query = f"""
         SELECT
             asset.id,
@@ -734,15 +875,13 @@ async def get_image_assets(
             asset.image_asset.full_size.height_pixels,
             asset.image_asset.full_size.width_pixels,
             asset.image_asset.file_size
-        FROM
-            asset
-        WHERE
-            asset.type = 'IMAGE'
+        FROM asset
+        WHERE asset.type = 'IMAGE'
         LIMIT {limit}
     """
     
     try:
-        creds = get_credentials()
+        creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -756,9 +895,9 @@ async def get_image_assets(
         
         results = response.json()
         if not results.get('results'):
-            return "No image assets found for this customer ID."
+            return "No image assets found."
         
-        output_lines = [f"Image Assets for Customer ID {formatted_customer_id}:"]
+        output_lines = [f"Image Assets for {user_id} - Account {formatted_customer_id}:"]
         output_lines.append("=" * 80)
         
         for i, result in enumerate(results['results'], 1):
@@ -782,472 +921,20 @@ async def get_image_assets(
         
         return "\n".join(output_lines)
     
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
     except Exception as e:
         return f"Error retrieving image assets: {str(e)}"
 
 @mcp.tool()
-async def download_image_asset(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
-    asset_id: str = Field(description="The ID of the image asset to download"),
-    output_dir: str = Field(default="./ad_images", description="Directory to save the downloaded image"),
-    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
-) -> str:
-    """
-    Download a specific image asset from a Google Ads account.
-    
-    This tool allows you to download the full-size version of an image asset
-    for further processing, analysis, or backup.
-    
-    RECOMMENDED WORKFLOW:
-    1. First run list_accounts() to get available account IDs
-    2. Then run get_image_assets() to get available image asset IDs
-    3. Finally use this command to download specific images
-    
-    Args:
-        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
-        asset_id: The ID of the image asset to download
-        output_dir: Directory where the image should be saved (default: ./ad_images)
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Status message indicating success or failure of the download
-        
-    Example:
-        customer_id: "1234567890"
-        asset_id: "12345"
-        output_dir: "./my_ad_images"
-    """
-    query = f"""
-        SELECT
-            asset.id,
-            asset.name,
-            asset.image_asset.full_size.url
-        FROM
-            asset
-        WHERE
-            asset.type = 'IMAGE'
-            AND asset.id = {asset_id}
-        LIMIT 1
-    """
-    
-    try:
-        creds = get_credentials()
-        headers = get_headers(creds, login_customer_id if login_customer_id else None)
-        
-        formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
-        
-        payload = {"query": query}
-        response = requests.post(url, headers=headers, json=payload)
-        
-        if response.status_code != 200:
-            return f"Error retrieving image asset: {response.text}"
-        
-        results = response.json()
-        if not results.get('results'):
-            return f"No image asset found with ID {asset_id}"
-        
-        # Extract the image URL
-        asset = results['results'][0].get('asset', {})
-        image_url = asset.get('imageAsset', {}).get('fullSize', {}).get('url')
-        asset_name = asset.get('name', f"image_{asset_id}")
-        
-        if not image_url:
-            return f"No download URL found for image asset ID {asset_id}"
-        
-        # Validate and sanitize the output directory to prevent path traversal
-        try:
-            # Get the base directory (current working directory)
-            base_dir = Path.cwd()
-            # Resolve the output directory to an absolute path
-            resolved_output_dir = Path(output_dir).resolve()
-            
-            # Ensure the resolved path is within or under the current working directory
-            # This prevents path traversal attacks like "../../../etc"
-            try:
-                resolved_output_dir.relative_to(base_dir)
-            except ValueError:
-                # If the path is not relative to base_dir, use the default safe directory
-                resolved_output_dir = base_dir / "ad_images"
-                logger.warning(f"Invalid output directory '{output_dir}' - using default './ad_images'")
-            
-            # Create output directory if it doesn't exist
-            resolved_output_dir.mkdir(parents=True, exist_ok=True)
-            
-        except Exception as e:
-            return f"Error creating output directory: {str(e)}"
-        
-        # Download the image
-        image_response = requests.get(image_url)
-        if image_response.status_code != 200:
-            return f"Failed to download image: HTTP {image_response.status_code}"
-        
-        # Clean the filename to be safe for filesystem
-        safe_name = ''.join(c for c in asset_name if c.isalnum() or c in ' ._-')
-        filename = f"{asset_id}_{safe_name}.jpg"
-        file_path = resolved_output_dir / filename
-        
-        # Save the image
-        with open(file_path, 'wb') as f:
-            f.write(image_response.content)
-        
-        return f"Successfully downloaded image asset {asset_id} to {file_path}"
-    
-    except Exception as e:
-        return f"Error downloading image asset: {str(e)}"
-
-@mcp.tool()
-async def get_asset_usage(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
-    asset_id: str = Field(default="", description="Optional: specific asset ID to look up (leave empty to get all image assets)"),
-    asset_type: str = Field(default="IMAGE", description="Asset type to search for ('IMAGE', 'TEXT', 'VIDEO', etc.)"),
-    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
-) -> str:
-    """
-    Find where specific assets are being used in campaigns, ad groups, and ads.
-    
-    This tool helps you analyze how assets are linked to campaigns and ads across your account,
-    which is useful for creative analysis and optimization.
-    
-    RECOMMENDED WORKFLOW:
-    1. First run list_accounts() to get available account IDs
-    2. Run get_image_assets() to see available assets
-    3. Use this command to see where specific assets are used
-    
-    Args:
-        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
-        asset_id: Optional specific asset ID to look up (leave empty to get all assets of the specified type)
-        asset_type: Type of asset to search for (default: 'IMAGE')
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Formatted report showing where assets are used in the account
-        
-    Example:
-        customer_id: "1234567890"
-        asset_id: "12345"
-        asset_type: "IMAGE"
-    """
-    # Build the query based on whether a specific asset ID was provided
-    where_clause = f"asset.type = '{asset_type}'"
-    if asset_id:
-        where_clause += f" AND asset.id = {asset_id}"
-    
-    # First get the assets themselves
-    assets_query = f"""
-        SELECT
-            asset.id,
-            asset.name,
-            asset.type
-        FROM
-            asset
-        WHERE
-            {where_clause}
-        LIMIT 100
-    """
-    
-    # Then get the associations between assets and campaigns
-    associations_query = f"""
-        SELECT
-            campaign.id,
-            campaign.name,
-            asset.id,
-            asset.name,
-            asset.type
-        FROM
-            campaign_asset
-        WHERE
-            {where_clause}
-        LIMIT 500
-    """
-    
-    try:
-        creds = get_credentials()
-        headers = get_headers(creds, login_customer_id if login_customer_id else None)
-        
-        formatted_customer_id = format_customer_id(customer_id)
-        
-        # First get the assets
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
-        payload = {"query": assets_query}
-        assets_response = requests.post(url, headers=headers, json=payload)
-        
-        if assets_response.status_code != 200:
-            return f"Error retrieving assets: {assets_response.text}"
-        
-        assets_results = assets_response.json()
-        if not assets_results.get('results'):
-            return f"No {asset_type} assets found for this customer ID."
-        
-        # Now get the associations
-        payload = {"query": associations_query}
-        assoc_response = requests.post(url, headers=headers, json=payload)
-        
-        if assoc_response.status_code != 200:
-            return f"Error retrieving asset associations: {assoc_response.text}"
-        
-        assoc_results = assoc_response.json()
-        
-        # Format the results in a readable way
-        output_lines = [f"Asset Usage for Customer ID {formatted_customer_id}:"]
-        output_lines.append("=" * 80)
-        
-        # Create a dictionary to organize asset usage by asset ID
-        asset_usage = {}
-        
-        # Initialize the asset usage dictionary with basic asset info
-        for result in assets_results.get('results', []):
-            asset = result.get('asset', {})
-            asset_id_val = asset.get('id')
-            if asset_id_val:
-                asset_usage[asset_id_val] = {
-                    'name': asset.get('name', 'Unnamed asset'),
-                    'type': asset.get('type', 'Unknown'),
-                    'usage': []
-                }
-        
-        # Add usage information from the associations
-        for result in assoc_results.get('results', []):
-            asset = result.get('asset', {})
-            asset_id_val = asset.get('id')
-            
-            if asset_id_val and asset_id_val in asset_usage:
-                campaign = result.get('campaign', {})
-                ad_group = result.get('adGroup', {})
-                
-                usage_info = {
-                    'campaign_id': campaign.get('id', 'N/A'),
-                    'campaign_name': campaign.get('name', 'N/A'),
-                    'ad_group_id': ad_group.get('id', 'N/A'),
-                    'ad_group_name': ad_group.get('name', 'N/A'),
-                }
-                
-                asset_usage[asset_id_val]['usage'].append(usage_info)
-        
-        # Format the output
-        for asset_id_val, info in asset_usage.items():
-            output_lines.append(f"\nAsset ID: {asset_id_val}")
-            output_lines.append(f"Name: {info['name']}")
-            output_lines.append(f"Type: {info['type']}")
-            
-            if info['usage']:
-                output_lines.append("\nUsed in:")
-                output_lines.append("-" * 60)
-                output_lines.append(f"{'Campaign':<30} | {'Ad Group':<30}")
-                output_lines.append("-" * 60)
-                
-                for usage in info['usage']:
-                    campaign_str = f"{usage['campaign_name']} ({usage['campaign_id']})"
-                    ad_group_str = f"{usage['ad_group_name']} ({usage['ad_group_id']})"
-                    
-                    output_lines.append(f"{campaign_str[:30]:<30} | {ad_group_str[:30]:<30}")
-            else:
-                output_lines.append("\n⚠️  Not currently used in any campaigns")
-            
-            output_lines.append("=" * 80)
-        
-        return "\n".join(output_lines)
-    
-    except Exception as e:
-        return f"Error retrieving asset usage: {str(e)}"
-
-@mcp.tool()
-async def analyze_image_assets(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
-    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)"),
-    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
-) -> str:
-    """
-    Analyze image assets with their performance metrics across campaigns.
-    
-    This comprehensive tool helps you understand which image assets are performing well
-    by showing metrics like impressions, clicks, and conversions for each image.
-    
-    RECOMMENDED WORKFLOW:
-    1. First run list_accounts() to get available account IDs
-    2. Then run get_account_currency() to see what currency the account uses
-    3. Finally run this command to analyze image asset performance
-    
-    Args:
-        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
-        days: Number of days to look back (default: 30)
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Detailed report of image assets and their performance metrics
-        
-    Example:
-        customer_id: "1234567890"
-        days: 14
-    """
-    query = f"""
-        SELECT
-            asset.id,
-            asset.name,
-            asset.image_asset.full_size.url,
-            asset.image_asset.full_size.width_pixels,
-            asset.image_asset.full_size.height_pixels,
-            campaign.name,
-            metrics.impressions,
-            metrics.clicks,
-            metrics.conversions,
-            metrics.cost_micros
-        FROM
-            campaign_asset
-        WHERE
-            asset.type = 'IMAGE'
-            AND segments.date DURING LAST_30_DAYS
-        ORDER BY
-            metrics.impressions DESC
-        LIMIT 200
-    """
-    
-    try:
-        creds = get_credentials()
-        headers = get_headers(creds, login_customer_id if login_customer_id else None)
-        
-        formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
-        
-        payload = {"query": query}
-        response = requests.post(url, headers=headers, json=payload)
-        
-        if response.status_code != 200:
-            return f"Error analyzing image assets: {response.text}"
-        
-        results = response.json()
-        if not results.get('results'):
-            return "No image asset performance data found for this customer ID and time period."
-        
-        # Group results by asset ID
-        assets_data = {}
-        for result in results.get('results', []):
-            asset = result.get('asset', {})
-            asset_id_val = asset.get('id')
-            
-            if asset_id_val not in assets_data:
-                assets_data[asset_id_val] = {
-                    'name': asset.get('name', f"Asset {asset_id_val}"),
-                    'url': asset.get('imageAsset', {}).get('fullSize', {}).get('url', 'N/A'),
-                    'dimensions': f"{asset.get('imageAsset', {}).get('fullSize', {}).get('widthPixels', 'N/A')} x {asset.get('imageAsset', {}).get('fullSize', {}).get('heightPixels', 'N/A')}",
-                    'impressions': 0,
-                    'clicks': 0,
-                    'conversions': 0,
-                    'cost_micros': 0,
-                    'campaigns': set()
-                }
-            
-            # Aggregate metrics
-            metrics = result.get('metrics', {})
-            assets_data[asset_id_val]['impressions'] += int(metrics.get('impressions', 0))
-            assets_data[asset_id_val]['clicks'] += int(metrics.get('clicks', 0))
-            assets_data[asset_id_val]['conversions'] += float(metrics.get('conversions', 0))
-            assets_data[asset_id_val]['cost_micros'] += int(metrics.get('costMicros', 0))
-            
-            # Add campaign info
-            campaign = result.get('campaign', {})
-            if campaign.get('name'):
-                assets_data[asset_id_val]['campaigns'].add(campaign.get('name'))
-        
-        # Format the results
-        output_lines = [f"Image Asset Performance Analysis for Customer ID {formatted_customer_id} (Last {days} days):"]
-        output_lines.append("=" * 100)
-        
-        # Sort assets by impressions (highest first)
-        sorted_assets = sorted(assets_data.items(), key=lambda x: x[1]['impressions'], reverse=True)
-        
-        for asset_id_val, data in sorted_assets:
-            output_lines.append(f"\nAsset ID: {asset_id_val}")
-            output_lines.append(f"Name: {data['name']}")
-            output_lines.append(f"Dimensions: {data['dimensions']}")
-            
-            # Calculate CTR if there are impressions
-            ctr = (data['clicks'] / data['impressions'] * 100) if data['impressions'] > 0 else 0
-            
-            # Format metrics
-            output_lines.append(f"\nPerformance Metrics:")
-            output_lines.append(f"  Impressions: {data['impressions']:,}")
-            output_lines.append(f"  Clicks: {data['clicks']:,}")
-            output_lines.append(f"  CTR: {ctr:.2f}%")
-            output_lines.append(f"  Conversions: {data['conversions']:.2f}")
-            output_lines.append(f"  Cost (micros): {data['cost_micros']:,}")
-            
-            # Show where it's used
-            output_lines.append(f"\nUsed in {len(data['campaigns'])} campaigns:")
-            for campaign in list(data['campaigns'])[:5]:  # Show first 5 campaigns
-                output_lines.append(f"  - {campaign}")
-            if len(data['campaigns']) > 5:
-                output_lines.append(f"  - ... and {len(data['campaigns']) - 5} more")
-            
-            # Add URL
-            if data['url'] != 'N/A':
-                output_lines.append(f"\nImage URL: {data['url']}")
-            
-            output_lines.append("-" * 100)
-        
-        return "\n".join(output_lines)
-    
-    except Exception as e:
-        return f"Error analyzing image assets: {str(e)}"
-
-@mcp.tool()
-async def list_resources(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
-    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
-) -> str:
-    """
-    List valid resources that can be used in GAQL FROM clauses.
-    
-    This tool helps you discover what resources are available in the Google Ads API
-    that you can query. Useful for building custom GAQL queries.
-    
-    Args:
-        customer_id: The Google Ads customer ID as a string
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Formatted list of valid resources
-    """
-    query = """
-        SELECT
-            google_ads_field.name,
-            google_ads_field.category,
-            google_ads_field.data_type
-        FROM
-            google_ads_field
-        WHERE
-            google_ads_field.category = 'RESOURCE'
-        ORDER BY
-            google_ads_field.name
-        LIMIT 100
-    """
-    
-    return await run_gaql(customer_id, query, "table", login_customer_id)
-
-# NEW HELPFUL TOOLS BELOW
-
-@mcp.tool()
 async def get_keyword_performance(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     min_impressions: int = Field(default=100, description="Minimum impressions filter"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Get keyword performance metrics including Quality Score.
-    
-    This tool helps you analyze which keywords are performing well and identify
-    opportunities for optimization based on Quality Score and performance metrics.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        days: Number of days to look back (default: 30)
-        min_impressions: Only show keywords with at least this many impressions
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Formatted table of keyword performance data
-    """
+    """Get keyword performance metrics including Quality Score."""
     query = f"""
         SELECT
             ad_group_criterion.keyword.text,
@@ -1270,26 +957,15 @@ async def get_keyword_performance(
         LIMIT 100
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def get_budget_utilization(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Analyze budget utilization across campaigns.
-    
-    This tool shows you how much of each campaign's budget is being used,
-    helping you identify campaigns that might need budget adjustments.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Budget analysis for active campaigns
-    """
+    """Analyze budget utilization across campaigns."""
     query = """
         SELECT
             campaign.id,
@@ -1309,9 +985,8 @@ async def get_budget_utilization(
     """
     
     try:
-        result = await execute_gaql_query(customer_id, query, login_customer_id)
+        result = await execute_gaql_query(user_id, customer_id, query, login_customer_id)
         
-        # Add budget utilization analysis
         if "Error" not in result and "No results" not in result:
             result += "\n\n💡 Budget Analysis Tips:"
             result += "\n- Check campaigns with cost approaching budget_amount"
@@ -1324,26 +999,13 @@ async def get_budget_utilization(
 
 @mcp.tool()
 async def get_search_terms(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     min_impressions: int = Field(default=10, description="Minimum impressions filter"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Get actual search terms that triggered your ads.
-    
-    This tool shows you what people actually searched for when your ads appeared,
-    helping you discover new keyword opportunities and negative keywords.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        days: Number of days to look back
-        min_impressions: Minimum impressions to include
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        List of search terms with performance metrics
-    """
+    """Get actual search terms that triggered your ads."""
     query = f"""
         SELECT
             search_term_view.search_term,
@@ -1362,28 +1024,16 @@ async def get_search_terms(
         LIMIT 100
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def get_audience_performance(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Analyze performance by audience demographics (age, gender, device).
-    
-    This tool helps you understand which audience segments are performing best,
-    allowing you to optimize bids and targeting.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        days: Number of days to look back
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Audience performance breakdown
-    """
+    """Analyze performance by audience demographics."""
     query = f"""
         SELECT
             campaign.name,
@@ -1402,26 +1052,15 @@ async def get_audience_performance(
         LIMIT 100
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def get_conversion_actions(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    List all conversion actions configured in the account.
-    
-    This tool shows you what conversion actions are being tracked,
-    helping you understand your conversion tracking setup.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        List of conversion actions with their settings
-    """
+    """List all conversion actions configured in the account."""
     query = """
         SELECT
             conversion_action.id,
@@ -1436,27 +1075,15 @@ async def get_conversion_actions(
         ORDER BY conversion_action.name
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def get_negative_keywords(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    List all negative keywords at campaign and ad group level.
-    
-    This tool helps you review your negative keyword lists to ensure
-    you're properly filtering out unwanted traffic.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        List of negative keywords organized by campaign/ad group
-    """
-    # Campaign-level negative keywords
+    """List all negative keywords at campaign and ad group level."""
     campaign_query = """
         SELECT
             campaign.id,
@@ -1471,7 +1098,6 @@ async def get_negative_keywords(
         LIMIT 200
     """
     
-    # Ad group-level negative keywords
     adgroup_query = """
         SELECT
             campaign.name,
@@ -1487,8 +1113,8 @@ async def get_negative_keywords(
     """
     
     try:
-        campaign_result = await execute_gaql_query(customer_id, campaign_query, login_customer_id)
-        adgroup_result = await execute_gaql_query(customer_id, adgroup_query, login_customer_id)
+        campaign_result = await execute_gaql_query(user_id, customer_id, campaign_query, login_customer_id)
+        adgroup_result = await execute_gaql_query(user_id, customer_id, adgroup_query, login_customer_id)
         
         output = "=" * 80
         output += "\n📛 CAMPAIGN-LEVEL NEGATIVE KEYWORDS\n"
@@ -1505,24 +1131,12 @@ async def get_negative_keywords(
 
 @mcp.tool()
 async def get_location_performance(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Analyze performance by geographic location.
-    
-    This tool shows you which locations are driving the best results,
-    helping you optimize location targeting and bids.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        days: Number of days to look back
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Performance breakdown by location
-    """
+    """Analyze performance by geographic location."""
     query = f"""
         SELECT
             campaign.name,
@@ -1541,28 +1155,16 @@ async def get_location_performance(
         LIMIT 100
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
 @mcp.tool()
 async def get_ad_schedule_performance(
+    user_id: str = Field(description="Unique identifier for the user"),
     customer_id: str = Field(description="Google Ads customer ID"),
     days: int = Field(default=30, description="Number of days to look back"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Analyze performance by day of week and hour of day.
-    
-    This tool helps you identify the best times to show your ads,
-    allowing you to optimize ad scheduling and bid adjustments.
-    
-    Args:
-        customer_id: Google Ads customer ID
-        days: Number of days to look back
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Performance breakdown by time
-    """
+    """Analyze performance by day of week and hour of day."""
     query = f"""
         SELECT
             campaign.name,
@@ -1581,100 +1183,177 @@ async def get_ad_schedule_performance(
         LIMIT 200
     """
     
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
-@mcp.resource("gaql://reference")
-def gaql_reference() -> str:
-    """Google Ads Query Language (GAQL) reference documentation."""
-    return """
-    # Google Ads Query Language (GAQL) Reference
-    
-    GAQL is similar to SQL but with specific syntax for Google Ads. Here's a quick reference:
-    
-    ## Basic Query Structure
-    ```
-    SELECT field1, field2, ... 
-    FROM resource_type
-    WHERE condition
-    ORDER BY field [ASC|DESC]
-    LIMIT n
-    ```
-    
-    ## Common Field Types
-    
-    ### Resource Fields
-    - campaign.id, campaign.name, campaign.status
-    - ad_group.id, ad_group.name, ad_group.status
-    - ad_group_ad.ad.id, ad_group_ad.ad.final_urls
-    - keyword.text, keyword.match_type
-    
-    ### Metric Fields
-    - metrics.impressions
-    - metrics.clicks
-    - metrics.cost_micros
-    - metrics.conversions
-    - metrics.ctr
-    - metrics.average_cpc
-    
-    ### Segment Fields
-    - segments.date
-    - segments.device
-    - segments.day_of_week
-    
-    ## Common WHERE Clauses
-    
-    ### Date Ranges
-    - WHERE segments.date DURING LAST_7_DAYS
-    - WHERE segments.date DURING LAST_30_DAYS
-    - WHERE segments.date BETWEEN '2023-01-01' AND '2023-01-31'
-    
-    ### Filtering
-    - WHERE campaign.status = 'ENABLED'
-    - WHERE metrics.clicks > 100
-    - WHERE campaign.name LIKE '%Brand%'
-    
-    ## Tips
-    - Always check account currency before analyzing cost data
-    - Cost values are in micros (millionths): 1000000 = 1 unit of currency
-    - Use LIMIT to avoid large result sets
+@mcp.tool()
+async def download_image_asset(
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID"),
+    asset_id: str = Field(description="The ID of the image asset to download"),
+    output_dir: str = Field(default="./ad_images", description="Directory to save the downloaded image"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
+) -> str:
+    """Download a specific image asset from a Google Ads account."""
+    query = f"""
+        SELECT
+            asset.id,
+            asset.name,
+            asset.image_asset.full_size.url
+        FROM asset
+        WHERE
+            asset.type = 'IMAGE'
+            AND asset.id = {asset_id}
+        LIMIT 1
     """
+    
+    try:
+        creds = get_user_credentials(user_id)
+        headers = get_headers(creds, login_customer_id if login_customer_id else None)
+        
+        formatted_customer_id = format_customer_id(customer_id)
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        
+        payload = {"query": query}
+        response = requests.post(url, headers=headers, json=payload)
+        
+        if response.status_code != 200:
+            return f"Error retrieving image asset: {response.text}"
+        
+        results = response.json()
+        if not results.get('results'):
+            return f"No image asset found with ID {asset_id}"
+        
+        asset = results['results'][0].get('asset', {})
+        image_url = asset.get('imageAsset', {}).get('fullSize', {}).get('url')
+        asset_name = asset.get('name', f"image_{asset_id}")
+        
+        if not image_url:
+            return f"No download URL found for image asset ID {asset_id}"
+        
+        # Security: validate output directory
+        try:
+            base_dir = Path.cwd()
+            resolved_output_dir = Path(output_dir).resolve()
+            
+            try:
+                resolved_output_dir.relative_to(base_dir)
+            except ValueError:
+                resolved_output_dir = base_dir / "ad_images"
+                logger.warning(f"Invalid output directory '{output_dir}' - using default './ad_images'")
+            
+            resolved_output_dir.mkdir(parents=True, exist_ok=True)
+            
+        except Exception as e:
+            return f"Error creating output directory: {str(e)}"
+        
+        # Download image
+        image_response = requests.get(image_url)
+        if image_response.status_code != 200:
+            return f"Failed to download image: HTTP {image_response.status_code}"
+        
+        safe_name = ''.join(c for c in asset_name if c.isalnum() or c in ' ._-')
+        filename = f"{asset_id}_{safe_name}.jpg"
+        file_path = resolved_output_dir / filename
+        
+        with open(file_path, 'wb') as f:
+            f.write(image_response.content)
+        
+        return f"Successfully downloaded image asset {asset_id} to {file_path}"
+    
+    except ValueError as e:
+        return f"Authentication error: {str(e)}"
+    except Exception as e:
+        return f"Error downloading image asset: {str(e)}"
 
-@mcp.prompt("google_ads_workflow")
-def google_ads_workflow() -> str:
-    """Provides guidance on the recommended workflow for using Google Ads tools."""
-    return """
-    I'll help you analyze your Google Ads account data. Here's the recommended workflow:
+@mcp.tool()
+async def get_asset_usage(
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID"),
+    asset_id: str = Field(default="", description="Optional: specific asset ID"),
+    asset_type: str = Field(default="IMAGE", description="Asset type"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
+) -> str:
+    """Find where specific assets are being used in campaigns."""
+    where_clause = f"asset.type = '{asset_type}'"
+    if asset_id:
+        where_clause += f" AND asset.id = {asset_id}"
     
-    1. First, let's list all the accounts you have access to:
-       - Run the `list_accounts()` tool to get available account IDs
-    
-    2. Before analyzing cost data, let's check which currency the account uses:
-       - Run `get_account_currency(customer_id="ACCOUNT_ID")` with your selected account
-    
-    3. Now we can explore the account data:
-       - For campaign performance: `get_campaign_performance(customer_id="ACCOUNT_ID", days=30)`
-       - For ad performance: `get_ad_performance(customer_id="ACCOUNT_ID", days=30)`
-       - For keyword performance: `get_keyword_performance(customer_id="ACCOUNT_ID", days=30)`
-       - For ad creative review: `get_ad_creatives(customer_id="ACCOUNT_ID")`
-    
-    4. For custom queries, use the GAQL query tool:
-       - `run_gaql(customer_id="ACCOUNT_ID", query="YOUR_QUERY", format="table")`
-    
-    Important: Always provide the customer_id as a string.
-    For example: customer_id="1234567890"
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            asset.id,
+            asset.name,
+            asset.type
+        FROM campaign_asset
+        WHERE {where_clause}
+        LIMIT 500
     """
+    
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
 
-# ----------------------------
-# MAIN — Streamable HTTP on 127.0.0.1:8001/mcp
-# ----------------------------
+@mcp.tool()
+async def analyze_image_assets(
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID"),
+    days: int = Field(default=30, description="Number of days to look back"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
+) -> str:
+    """Analyze image assets with their performance metrics."""
+    query = f"""
+        SELECT
+            asset.id,
+            asset.name,
+            asset.image_asset.full_size.url,
+            asset.image_asset.full_size.width_pixels,
+            asset.image_asset.full_size.height_pixels,
+            campaign.name,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.conversions,
+            metrics.cost_micros
+        FROM campaign_asset
+        WHERE
+            asset.type = 'IMAGE'
+            AND segments.date DURING LAST_{days}_DAYS
+        ORDER BY metrics.impressions DESC
+        LIMIT 200
+    """
+    
+    return await execute_gaql_query(user_id, customer_id, query, login_customer_id)
+
+@mcp.tool()
+async def list_resources(
+    user_id: str = Field(description="Unique identifier for the user"),
+    customer_id: str = Field(description="Google Ads customer ID"),
+    login_customer_id: str = Field(default="", description="Optional: Manager account ID")
+) -> str:
+    """List valid resources that can be used in GAQL FROM clauses."""
+    query = """
+        SELECT
+            google_ads_field.name,
+            google_ads_field.category,
+            google_ads_field.data_type
+        FROM google_ads_field
+        WHERE google_ads_field.category = 'RESOURCE'
+        ORDER BY google_ads_field.name
+        LIMIT 100
+    """
+    
+    return await run_gaql(user_id, customer_id, query, "table", login_customer_id)
+
+# ============================================================================
+# MAIN
+# ============================================================================
 if __name__ == "__main__":
     try:
         if not GOOGLE_ADS_DEVELOPER_TOKEN:
             raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN not set")
+        if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
+            raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set for multi-user OAuth")
         
-        logger.info("✓ Required environment variables configured")
-        logger.info(f"✓ Auth type: {GOOGLE_ADS_AUTH_TYPE}")
-        logger.info(f"✓ Token file location: {TOKEN_FILE}")
+        logger.info("✓ Multi-user configuration validated")
+        logger.info(f"✓ Token storage directory: {TOKEN_STORAGE_DIR}")
         
     except Exception as e:
         logger.error(f"Configuration error: {e}")
@@ -1683,7 +1362,7 @@ if __name__ == "__main__":
     host = "127.0.0.1"
     port = int(os.getenv("PORT", "8001"))
     
-    logger.info(f"Starting Google Ads MCP server at http://{host}:{port}/mcp")
+    logger.info(f"Starting MULTI-USER Google Ads MCP server at http://{host}:{port}/mcp")
     logger.info("=" * 60)
     
     mcp.run(
