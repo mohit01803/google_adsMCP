@@ -15,52 +15,83 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 import logging
 
+# ============================================================================
+# LOAD ENVIRONMENT VARIABLES FIRST
+# ============================================================================
+try:
+    from dotenv import load_dotenv
+    env_path = Path('.') / '.env'
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        print(f"✓ Loaded .env from: {env_path.absolute()}")
+    else:
+        print("⚠ .env not found - using hardcoded Neon defaults")
+except ImportError:
+    print("⚠ python-dotenv not installed")
+
+# Import PostgreSQL storage AFTER loading env vars
+from postgres_storage import PostgresTokenStorage
+
 # MCP - Support both package layouts
 try:
     from fastmcp import FastMCP
 except ImportError:
     from mcp.server.fastmcp import FastMCP
 
-# Configure logging
+# ============================================================================
+# CONFIGURE LOGGING - CONSOLE ONLY (NO FILE LOGGING FOR FASTMCP!)
+# ============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stderr)
+        logging.StreamHandler(sys.stderr)  # Console only - FastMCP compatible
     ]
 )
 logger = logging.getLogger('google_ads_server')
 
-mcp = FastMCP(
-    "google-ads-server",
-    dependencies=[
-        "google-auth-oauthlib",
-        "google-auth",
-        "requests",
-        "python-dotenv"
-    ]
-)
+# ============================================================================
+# FASTMCP INITIALIZATION - NO DEPENDENCIES PARAMETER (DEPRECATED)
+# ============================================================================
+mcp = FastMCP("google-ads-server")
 
 # Constants and configuration
 SCOPES = ['https://www.googleapis.com/auth/adwords']
 API_VERSION = "v19"
 
-# MULTI-USER: Token storage per user
-TOKEN_STORAGE_DIR = Path(os.environ.get("TOKEN_STORAGE_PATH", "/tmp/google_ads_tokens"))
-TOKEN_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+# ============================================================================
+# POSTGRES CONFIGURATION - NO FILE FALLBACK! PRODUCTION ONLY!
+# ============================================================================
+try:
+    # FIX #1: CORRECTED HOST - Removed "localhost" prefix typo!
+    POSTGRES_STORAGE = PostgresTokenStorage(
+        host=os.getenv('POSTGRES_HOST', 'jolly-base-ad5zrzvc-pooler.c-2.us-east-1.aws.neon.tech'),
+        port=int(os.getenv('POSTGRES_PORT', '5432')),
+        database=os.getenv('POSTGRES_DB', 'neondb'),
+        user=os.getenv('POSTGRES_USER', 'neondb_owner'),
+        password=os.getenv('POSTGRES_PASSWORD', 'npg_h1HGqr8Y8KRWGep')
+    )
+    USE_POSTGRES = True
+    logger.info("=" * 60)
+    logger.info("✓ PostgreSQL connection successful!")
+    logger.info("✓ Using PostgreSQL token storage (Neon.tech)")
+    logger.info(f"  Host: {os.getenv('POSTGRES_HOST', 'jolly-base-ad5zrzvc-pooler.c-2.us-east-1.aws.neon.tech')}")
+    logger.info(f"  Database: {os.getenv('POSTGRES_DB', 'neondb')}")
+    logger.info("=" * 60)
+except Exception as e:
+    logger.error("=" * 60)
+    logger.error(f"✗ PostgreSQL initialization failed: {e}")
+    logger.error(f"  Error type: {type(e).__name__}")
+    logger.error("⚠ CRITICAL: PostgreSQL required for production!")
+    logger.error("=" * 60)
+    USE_POSTGRES = False
+    # FIX #2: NO FILE FALLBACK - Production must have PostgreSQL!
+    raise Exception("PostgreSQL connection failed! Cannot run without database.")
 
 logger.info("=" * 60)
 logger.info("Google Ads MCP Server Starting (MULTI-USER MODE)...")
-logger.info(f"Token storage directory: {TOKEN_STORAGE_DIR}")
+logger.info("Storage: PostgreSQL (Neon.tech) - NO FILE FALLBACK")
 logger.info("=" * 60)
-
-# Load environment variables
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    logger.info("Environment variables loaded from .env file")
-except ImportError:
-    logger.warning("python-dotenv not installed, skipping .env file loading")
 
 # Get credentials from environment variables
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
@@ -68,81 +99,85 @@ GOOGLE_ADS_CLIENT_ID = os.environ.get("GOOGLE_ADS_CLIENT_ID")
 GOOGLE_ADS_CLIENT_SECRET = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
 
 # MULTI-USER: In-memory cache for user credentials
-# In production, use Redis or database
 USER_CREDENTIALS_CACHE = {}
 
-def get_user_token_file(user_id: str) -> Path:
-    """Get the token file path for a specific user."""
-    # Hash user_id for privacy and to avoid filesystem issues
-    user_hash = hashlib.sha256(user_id.encode()).hexdigest()[:16]
-    return TOKEN_STORAGE_DIR / f"token_{user_hash}.json"
+# ============================================================================
+# FIX #3: REMOVED ALL FILE STORAGE FUNCTIONS - POSTGRESQL ONLY!
+# ============================================================================
 
 def save_user_token(user_id: str, creds: Credentials):
-    """Save user's OAuth token."""
-    token_file = get_user_token_file(user_id)
+    """Save user's OAuth token - PostgreSQL ONLY (NO FILE FALLBACK)."""
+    if not USE_POSTGRES:
+        error_msg = "PostgreSQL not available! Cannot save token."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
     try:
-        with open(token_file, 'w') as f:
-            f.write(creds.to_json())
-        logger.info(f"Saved token for user: {user_id}")
-        # Also cache in memory
-        USER_CREDENTIALS_CACHE[user_id] = creds
+        if POSTGRES_STORAGE.save_token(user_id, creds):
+            USER_CREDENTIALS_CACHE[user_id] = creds
+            logger.info(f"✓ Token saved to PostgreSQL for user: {user_id}")
+            return True
+        else:
+            raise Exception("PostgreSQL save_token returned False")
     except Exception as e:
-        logger.error(f"Error saving token for user {user_id}: {e}")
-        raise
+        error_msg = f"Failed to save token to PostgreSQL: {e}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
 
 def load_user_token(user_id: str) -> Optional[Credentials]:
-    """Load user's OAuth token from cache or file."""
-    # First check in-memory cache
+    """Load user's OAuth token - PostgreSQL ONLY (NO FILE FALLBACK)."""
+    # Check in-memory cache first
     if user_id in USER_CREDENTIALS_CACHE:
-        logger.info(f"Loaded token from cache for user: {user_id}")
+        logger.info(f"✓ Loaded token from cache for user: {user_id}")
         return USER_CREDENTIALS_CACHE[user_id]
     
-    # Then check file
-    token_file = get_user_token_file(user_id)
-    if token_file.exists():
-        try:
-            creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-            USER_CREDENTIALS_CACHE[user_id] = creds
-            logger.info(f"Loaded token from file for user: {user_id}")
-            return creds
-        except Exception as e:
-            logger.warning(f"Could not load token for user {user_id}: {e}")
+    if not USE_POSTGRES:
+        logger.error("PostgreSQL not available! Cannot load token.")
+        return None
     
-    return None
+    try:
+        creds = POSTGRES_STORAGE.load_token(user_id)
+        if creds:
+            USER_CREDENTIALS_CACHE[user_id] = creds
+            logger.info(f"✓ Loaded token from PostgreSQL for user: {user_id}")
+            return creds
+        else:
+            logger.info(f"No token found in PostgreSQL for user: {user_id}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to load token from PostgreSQL: {e}")
+        return None
 
 def delete_user_token(user_id: str):
-    """Delete user's stored token."""
-    token_file = get_user_token_file(user_id)
-    if token_file.exists():
-        token_file.unlink()
+    """Delete user's token - PostgreSQL ONLY (NO FILE FALLBACK)."""
+    if USE_POSTGRES:
+        try:
+            POSTGRES_STORAGE.delete_token(user_id)
+            logger.info(f"✓ Deleted token from PostgreSQL for user: {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete token from PostgreSQL: {e}")
+    
+    # Always clear from cache
     if user_id in USER_CREDENTIALS_CACHE:
         del USER_CREDENTIALS_CACHE[user_id]
-    logger.info(f"Deleted token for user: {user_id}")
+        logger.info(f"✓ Cleared token from cache for user: {user_id}")
 
 def get_user_credentials(user_id: str, refresh_if_needed: bool = True) -> Credentials:
-    """
-    Get OAuth credentials for a specific user.
-    
-    Args:
-        user_id: Unique identifier for the user (email, user_id, etc.)
-        refresh_if_needed: Whether to refresh expired tokens
-    """
+    """Get OAuth credentials for a specific user."""
     if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
         raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set")
     
     creds = load_user_token(user_id)
     
-    # If credentials exist but are expired, try to refresh
     if creds and not creds.valid and refresh_if_needed:
         if creds.expired and creds.refresh_token:
             try:
                 logger.info(f"Refreshing expired token for user: {user_id}")
                 creds.refresh(Request())
                 save_user_token(user_id, creds)
-                logger.info(f"Token refreshed successfully for user: {user_id}")
+                logger.info(f"✓ Token refreshed successfully for user: {user_id}")
             except RefreshError as e:
                 logger.error(f"Error refreshing token for user {user_id}: {e}")
-                # Delete invalid token
                 delete_user_token(user_id)
                 raise ValueError(f"Token expired and could not be refreshed. User needs to re-authenticate.")
         else:
@@ -180,7 +215,7 @@ def get_headers(creds: Credentials, login_customer_id: Optional[str] = None):
     return headers
 
 # ============================================================================
-# MULTI-USER AUTHENTICATION TOOLS
+# MULTI-USER AUTHENTICATION TOOLS (4 tools)
 # ============================================================================
 
 @mcp.tool()
@@ -188,26 +223,7 @@ async def start_oauth_flow(
     user_id: str = Field(description="Unique identifier for the user (email, username, etc.)"),
     redirect_uri: str = Field(default="urn:ietf:wg:oauth:2.0:oob", description="OAuth redirect URI")
 ) -> str:
-    """
-    Start OAuth authentication flow for a new user.
-    
-    This generates an authorization URL that the user must visit to grant access.
-    After granting access, they'll receive an authorization code.
-    
-    WORKFLOW:
-    1. Call this function with user's unique ID
-    2. Send the returned URL to the user
-    3. User visits URL and grants access
-    4. User receives authorization code
-    5. Call complete_oauth_flow() with the code
-    
-    Args:
-        user_id: Unique identifier for the user (email, username, etc.)
-        redirect_uri: OAuth redirect URI (default works for manual flow)
-        
-    Returns:
-        JSON with authorization URL and instructions
-    """
+    """Start OAuth authentication flow for a new user."""
     try:
         if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
             return json.dumps({
@@ -231,14 +247,12 @@ async def start_oauth_flow(
             redirect_uri=redirect_uri
         )
         
-        # Generate authorization URL
         auth_url, _ = flow.authorization_url(
             access_type='offline',
             include_granted_scopes='true',
             prompt='consent'
         )
         
-        # Store flow in cache for this user (temporary)
         USER_CREDENTIALS_CACHE[f"{user_id}_flow"] = flow
         
         return json.dumps({
@@ -256,30 +270,15 @@ async def start_oauth_flow(
         
     except Exception as e:
         logger.error(f"Error starting OAuth flow for user {user_id}: {e}")
-        return json.dumps({
-            "error": str(e)
-        })
+        return json.dumps({"error": str(e)})
 
 @mcp.tool()
 async def complete_oauth_flow(
     user_id: str = Field(description="Unique identifier for the user"),
     auth_code: str = Field(description="Authorization code received from Google")
 ) -> str:
-    """
-    Complete OAuth flow with the authorization code.
-    
-    After user visits the authorization URL and grants access, they receive a code.
-    Use that code here to complete authentication.
-    
-    Args:
-        user_id: Same user_id used in start_oauth_flow()
-        auth_code: Authorization code from Google
-        
-    Returns:
-        Success message with user's accessible accounts
-    """
+    """Complete OAuth flow with the authorization code."""
     try:
-        # Get the flow from cache
         flow_key = f"{user_id}_flow"
         flow = USER_CREDENTIALS_CACHE.get(flow_key)
         
@@ -289,17 +288,12 @@ async def complete_oauth_flow(
                 "message": f"Please call start_oauth_flow(user_id='{user_id}') first"
             })
         
-        # Exchange code for credentials
         flow.fetch_token(code=auth_code)
         creds = flow.credentials
         
-        # Save credentials for this user
         save_user_token(user_id, creds)
-        
-        # Clean up flow from cache
         del USER_CREDENTIALS_CACHE[flow_key]
         
-        # Try to get user's accounts to verify
         try:
             headers = get_headers(creds)
             url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
@@ -313,6 +307,7 @@ async def complete_oauth_flow(
                     "success": True,
                     "message": f"Authentication successful for user: {user_id}",
                     "accessible_accounts": account_count,
+                    "storage": "PostgreSQL (Neon.tech)",
                     "next_steps": [
                         "User can now use all Google Ads tools",
                         f"Use user_id='{user_id}' in all tool calls"
@@ -324,6 +319,7 @@ async def complete_oauth_flow(
         return json.dumps({
             "success": True,
             "message": f"Authentication successful for user: {user_id}",
+            "storage": "PostgreSQL (Neon.tech)",
             "next_steps": [
                 "User can now use all Google Ads tools",
                 f"Use user_id='{user_id}' in all tool calls"
@@ -341,15 +337,7 @@ async def complete_oauth_flow(
 async def check_user_auth(
     user_id: str = Field(description="Unique identifier for the user")
 ) -> str:
-    """
-    Check if a user is authenticated and their token is valid.
-    
-    Args:
-        user_id: User's unique identifier
-        
-    Returns:
-        Authentication status and token expiry info
-    """
+    """Check if a user is authenticated and their token is valid."""
     try:
         creds = load_user_token(user_id)
         
@@ -361,7 +349,6 @@ async def check_user_auth(
                 "action": f"Call start_oauth_flow(user_id='{user_id}') to authenticate"
             }, indent=2)
         
-        # Check if valid
         is_valid = creds.valid
         is_expired = creds.expired if hasattr(creds, 'expired') else False
         has_refresh = bool(creds.refresh_token) if hasattr(creds, 'refresh_token') else False
@@ -375,6 +362,7 @@ async def check_user_auth(
             "token_expired": is_expired,
             "has_refresh_token": has_refresh,
             "token_expiry": expiry_str,
+            "storage": "PostgreSQL (Neon.tech)",
             "status": "ready" if is_valid else "needs_refresh"
         }, indent=2)
         
@@ -388,15 +376,7 @@ async def check_user_auth(
 async def revoke_user_access(
     user_id: str = Field(description="Unique identifier for the user")
 ) -> str:
-    """
-    Revoke access and delete stored credentials for a user.
-    
-    Args:
-        user_id: User's unique identifier
-        
-    Returns:
-        Confirmation message
-    """
+    """Revoke access and delete stored credentials for a user."""
     try:
         delete_user_token(user_id)
         return json.dumps({
@@ -405,27 +385,17 @@ async def revoke_user_access(
             "action": "User must re-authenticate to use tools again"
         }, indent=2)
     except Exception as e:
-        return json.dumps({
-            "error": str(e)
-        })
+        return json.dumps({"error": str(e)})
 
 # ============================================================================
-# GOOGLE ADS TOOLS (WITH USER_ID)
+# GOOGLE ADS TOOLS (21 tools) - WITH USER_ID
 # ============================================================================
 
 @mcp.tool()
 async def list_accounts(
     user_id: str = Field(description="Unique identifier for the user")
 ) -> str:
-    """
-    List all accessible Google Ads accounts for a user.
-    
-    Args:
-        user_id: User's unique identifier
-        
-    Returns:
-        Formatted list of accessible accounts
-    """
+    """List all accessible Google Ads accounts for a user."""
     try:
         creds = get_user_credentials(user_id)
         headers = get_headers(creds)
@@ -500,7 +470,6 @@ async def get_campaign_performance(
         if not results.get('results'):
             return "No campaign data found for the specified period."
         
-        # Format results
         result_lines = [f"Campaign Performance for {user_id} - Account {formatted_customer_id}:"]
         result_lines.append("-" * 80)
         
@@ -531,18 +500,7 @@ async def execute_gaql_query(
     query: str = Field(description="Valid GAQL query string"),
     login_customer_id: str = Field(default="", description="Optional: Manager account ID")
 ) -> str:
-    """
-    Execute a custom GAQL query for a user's account.
-    
-    Args:
-        user_id: User's unique identifier
-        customer_id: Google Ads customer ID
-        query: GAQL query to execute
-        login_customer_id: Optional manager account ID
-        
-    Returns:
-        Formatted query results
-    """
+    """Execute a custom GAQL query for a user's account."""
     try:
         creds = get_user_credentials(user_id)
         headers = get_headers(creds, login_customer_id if login_customer_id else None)
@@ -560,7 +518,6 @@ async def execute_gaql_query(
         if not results.get('results'):
             return "No results found for the query."
         
-        # Format results as table
         result_lines = [f"Query Results for {user_id} - Account {formatted_customer_id}:"]
         result_lines.append("-" * 80)
         result_lines.append(json.dumps(results, indent=2))
@@ -1342,26 +1299,16 @@ async def list_resources(
     return await run_gaql(user_id, customer_id, query, "table", login_customer_id)
 
 # ============================================================================
-# MAIN
+# MAIN - FIX #5: HOST SET TO 0.0.0.0 FOR FASTMCP PRODUCTION!
 # ============================================================================
-if __name__ == "__main__":
-    try:
-        if not GOOGLE_ADS_DEVELOPER_TOKEN:
-            raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN not set")
-        if not GOOGLE_ADS_CLIENT_ID or not GOOGLE_ADS_CLIENT_SECRET:
-            raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set for multi-user OAuth")
-        
-        logger.info("✓ Multi-user configuration validated")
-        logger.info(f"✓ Token storage directory: {TOKEN_STORAGE_DIR}")
-        
-    except Exception as e:
-        logger.error(f"Configuration error: {e}")
-        sys.exit(1)
 
-    host = "127.0.0.1"
+if __name__ == "__main__":
+    host = "0.0.0.0"  # FIX #5: Listen on all interfaces for FastMCP
     port = int(os.getenv("PORT", "8001"))
     
+    logger.info("=" * 60)
     logger.info(f"Starting MULTI-USER Google Ads MCP server at http://{host}:{port}/mcp")
+    logger.info("Storage: PostgreSQL (Neon.tech) - NO FILE FALLBACK")
     logger.info("=" * 60)
     
     mcp.run(
@@ -1370,4 +1317,3 @@ if __name__ == "__main__":
         port=port,
         path="/mcp"
     )
-
